@@ -14,4 +14,8 @@
  * limitations under the License.
  */
 
+export * from './CollectorExporterBase';
 export * from './platform';
+export * as collectorTypes from './types';
+export { toCollectorExportTraceServiceRequest } from './transform';
+export { toCollectorExportMetricServiceRequest } from './transformMetrics';

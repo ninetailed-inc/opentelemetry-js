@@ -20,6 +20,7 @@ import {
   HttpTraceContext,
   HttpCorrelationContext,
   CompositePropagator,
+  notifyOnGlobalShutdown,
 } from '@opentelemetry/core';
 import { SpanProcessor, Tracer } from '.';
 import { DEFAULT_CONFIG } from './config';
@@ -35,6 +36,7 @@ export class BasicTracerProvider implements api.TracerProvider {
   private readonly _config: TracerConfig;
   private readonly _registeredSpanProcessors: SpanProcessor[] = [];
   private readonly _tracers: Map<string, Tracer> = new Map();
+  private _cleanNotifyOnGlobalShutdown: Function | undefined;
 
   activeSpanProcessor = new NoopSpanProcessor();
   readonly logger: api.Logger;
@@ -47,12 +49,20 @@ export class BasicTracerProvider implements api.TracerProvider {
       logger: this.logger,
       resource: this.resource,
     });
+    if (this._config.gracefulShutdown) {
+      this._cleanNotifyOnGlobalShutdown = notifyOnGlobalShutdown(
+        this._shutdownActiveProcessor.bind(this)
+      );
+    }
   }
 
   getTracer(name: string, version = '*', config?: TracerConfig): Tracer {
     const key = `${name}@${version}`;
     if (!this._tracers.has(key)) {
-      this._tracers.set(key, new Tracer(config || this._config, this));
+      this._tracers.set(
+        key,
+        new Tracer({ name, version }, config || this._config, this)
+      );
     }
 
     return this._tracers.get(key)!;
@@ -95,5 +105,17 @@ export class BasicTracerProvider implements api.TracerProvider {
     if (config.propagator) {
       api.propagation.setGlobalPropagator(config.propagator);
     }
+  }
+
+  shutdown(cb: () => void = () => {}) {
+    this.activeSpanProcessor.shutdown(cb);
+    if (this._cleanNotifyOnGlobalShutdown) {
+      this._cleanNotifyOnGlobalShutdown();
+      this._cleanNotifyOnGlobalShutdown = undefined;
+    }
+  }
+
+  private _shutdownActiveProcessor() {
+    this.activeSpanProcessor.shutdown();
   }
 }

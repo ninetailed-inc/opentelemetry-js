@@ -24,52 +24,85 @@ import {
 import * as core from '@opentelemetry/core';
 import { Resource } from '@opentelemetry/resources';
 import { ReadableSpan } from '@opentelemetry/tracing';
+import { CollectorExporterBase } from './CollectorExporterBase';
 import {
-  CollectorExporterBase,
+  COLLECTOR_SPAN_KIND_MAPPING,
+  opentelemetryProto,
   CollectorExporterConfigBase,
-} from './CollectorExporterBase';
-import { COLLECTOR_SPAN_KIND_MAPPING, opentelemetryProto } from './types';
-import ValueType = opentelemetryProto.common.v1.ValueType;
+} from './types';
 
 /**
- * Converts attributes
+ * Converts attributes to KeyValue array
  * @param attributes
  */
 export function toCollectorAttributes(
   attributes: Attributes
-): opentelemetryProto.common.v1.AttributeKeyValue[] {
+): opentelemetryProto.common.v1.KeyValue[] {
   return Object.keys(attributes).map(key => {
     return toCollectorAttributeKeyValue(key, attributes[key]);
   });
 }
 
 /**
- * Converts key and value to AttributeKeyValue
+ * Converts array of unknown value to ArrayValue
+ * @param values
+ */
+export function toCollectorArrayValue(
+  values: unknown[]
+): opentelemetryProto.common.v1.ArrayValue {
+  return {
+    values: values.map(value => toCollectorAnyValue(value)),
+  };
+}
+
+/**
+ * Converts attributes to KeyValueList
+ * @param attributes
+ */
+export function toCollectorKeyValueList(
+  attributes: Attributes
+): opentelemetryProto.common.v1.KeyValueList {
+  return {
+    values: toCollectorAttributes(attributes),
+  };
+}
+
+/**
+ * Converts key and unknown value to KeyValue
  * @param value event value
  */
 export function toCollectorAttributeKeyValue(
   key: string,
   value: unknown
-): opentelemetryProto.common.v1.AttributeKeyValue {
-  let aType: opentelemetryProto.common.v1.ValueType = ValueType.STRING;
-  const AttributeKeyValue: opentelemetryProto.common.v1.AttributeKeyValue = {
+): opentelemetryProto.common.v1.KeyValue {
+  const anyValue = toCollectorAnyValue(value);
+  return {
     key,
-    type: 0,
+    value: anyValue,
   };
+}
+
+/**
+ * Converts unknown value to AnyValue
+ * @param value
+ */
+export function toCollectorAnyValue(
+  value: unknown
+): opentelemetryProto.common.v1.AnyValue {
+  const anyValue: opentelemetryProto.common.v1.AnyValue = {};
   if (typeof value === 'string') {
-    AttributeKeyValue.stringValue = value;
+    anyValue.stringValue = value;
   } else if (typeof value === 'boolean') {
-    aType = ValueType.BOOL;
-    AttributeKeyValue.boolValue = value;
+    anyValue.boolValue = value;
   } else if (typeof value === 'number') {
     // all numbers will be treated as double
-    aType = ValueType.DOUBLE;
-    AttributeKeyValue.doubleValue = value;
+    anyValue.doubleValue = value;
+  } else if (Array.isArray(value)) {
+    anyValue.arrayValue = toCollectorArrayValue(value);
+  } else if (value) {
+    anyValue.kvlistValue = toCollectorKeyValueList(value as Attributes);
   }
-
-  AttributeKeyValue.type = aType;
-
-  return AttributeKeyValue;
+  return anyValue;
 }
 
 /**
@@ -150,12 +183,12 @@ export function toCollectorSpan(
  */
 export function toCollectorResource(
   resource?: Resource,
-  additionalAttributes: { [key: string]: any } = {}
+  additionalAttributes: { [key: string]: unknown } = {}
 ): opentelemetryProto.resource.v1.Resource {
   const attr = Object.assign(
     {},
     additionalAttributes,
-    resource ? resource.labels : {}
+    resource ? resource.attributes : {}
   );
   const resourceProto: opentelemetryProto.resource.v1.Resource = {
     attributes: toCollectorAttributes(attr),
@@ -193,45 +226,93 @@ export function toCollectorTraceState(
  * Prepares trace service request to be sent to collector
  * @param spans spans
  * @param collectorExporterBase
- * @param [name] Instrumentation Library Name
  */
 export function toCollectorExportTraceServiceRequest<
   T extends CollectorExporterConfigBase
 >(
   spans: ReadableSpan[],
-  collectorExporterBase: CollectorExporterBase<T>,
-  name = ''
+  collectorTraceExporterBase: CollectorExporterBase<
+    T,
+    ReadableSpan,
+    opentelemetryProto.collector.trace.v1.ExportTraceServiceRequest
+  >
 ): opentelemetryProto.collector.trace.v1.ExportTraceServiceRequest {
-  const spansToBeSent: opentelemetryProto.trace.v1.Span[] = spans.map(span =>
-    toCollectorSpan(span)
-  );
-  const resource: Resource =
-    spans.length > 0 ? spans[0].resource : Resource.empty();
+  const groupedSpans: Map<
+    Resource,
+    Map<core.InstrumentationLibrary, ReadableSpan[]>
+  > = groupSpansByResourceAndLibrary(spans);
 
   const additionalAttributes = Object.assign(
     {},
-    collectorExporterBase.attributes || {},
+    collectorTraceExporterBase.attributes,
     {
-      'service.name': collectorExporterBase.serviceName,
+      'service.name': collectorTraceExporterBase.serviceName,
     }
   );
-  const protoResource: opentelemetryProto.resource.v1.Resource = toCollectorResource(
-    resource,
-    additionalAttributes
-  );
-  const instrumentationLibrarySpans: opentelemetryProto.trace.v1.InstrumentationLibrarySpans = {
-    spans: spansToBeSent,
-    instrumentationLibrary: {
-      name: name || `${core.SDK_INFO.NAME} - ${core.SDK_INFO.LANGUAGE}`,
-      version: core.SDK_INFO.VERSION,
-    },
-  };
-  const resourceSpan: opentelemetryProto.trace.v1.ResourceSpans = {
-    resource: protoResource,
-    instrumentationLibrarySpans: [instrumentationLibrarySpans],
-  };
 
   return {
-    resourceSpans: [resourceSpan],
+    resourceSpans: toCollectorResourceSpans(groupedSpans, additionalAttributes),
   };
+}
+
+/**
+ * Takes an array of spans and groups them by resource and instrumentation
+ * library
+ * @param spans spans
+ */
+export function groupSpansByResourceAndLibrary(
+  spans: ReadableSpan[]
+): Map<Resource, Map<core.InstrumentationLibrary, ReadableSpan[]>> {
+  return spans.reduce((spanMap, span) => {
+    //group by resource
+    let resourceSpans = spanMap.get(span.resource);
+    if (!resourceSpans) {
+      resourceSpans = new Map<core.InstrumentationLibrary, ReadableSpan[]>();
+      spanMap.set(span.resource, resourceSpans);
+    }
+    //group by instrumentation library
+    let libSpans = resourceSpans.get(span.instrumentationLibrary);
+    if (!libSpans) {
+      libSpans = new Array<ReadableSpan>();
+      resourceSpans.set(span.instrumentationLibrary, libSpans);
+    }
+    libSpans.push(span);
+    return spanMap;
+  }, new Map<Resource, Map<core.InstrumentationLibrary, ReadableSpan[]>>());
+}
+
+/**
+ * Convert to InstrumentationLibrarySpans
+ * @param instrumentationLibrary
+ * @param spans
+ */
+function toCollectorInstrumentationLibrarySpans(
+  instrumentationLibrary: core.InstrumentationLibrary,
+  spans: ReadableSpan[]
+): opentelemetryProto.trace.v1.InstrumentationLibrarySpans {
+  return {
+    spans: spans.map(toCollectorSpan),
+    instrumentationLibrary,
+  };
+}
+
+/**
+ * Returns a list of resource spans which will be exported to the collector
+ * @param groupedSpans
+ * @param baseAttributes
+ */
+function toCollectorResourceSpans(
+  groupedSpans: Map<Resource, Map<core.InstrumentationLibrary, ReadableSpan[]>>,
+  baseAttributes: Attributes
+): opentelemetryProto.trace.v1.ResourceSpans[] {
+  return Array.from(groupedSpans, ([resource, libSpans]) => {
+    return {
+      resource: toCollectorResource(resource, baseAttributes),
+      instrumentationLibrarySpans: Array.from(
+        libSpans,
+        ([instrumentationLibrary, spans]) =>
+          toCollectorInstrumentationLibrarySpans(instrumentationLibrary, spans)
+      ),
+    };
+  });
 }

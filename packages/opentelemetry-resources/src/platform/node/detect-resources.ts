@@ -15,27 +15,69 @@
  */
 
 import { Resource } from '../../Resource';
-import { envDetector, awsEc2Detector, gcpDetector } from './detectors';
-import { Detector } from '../../types';
-
-const DETECTORS: Array<Detector> = [envDetector, awsEc2Detector, gcpDetector];
+import {
+  ResourceDetectionConfig,
+  ResourceDetectionConfigWithLogger,
+} from '../../config';
+import { Logger } from '@opentelemetry/api';
+import * as util from 'util';
+import { NoopLogger } from '@opentelemetry/core';
 
 /**
  * Runs all resource detectors and returns the results merged into a single
  * Resource.
+ *
+ * @param config Configuration for resource detection
  */
-export const detectResources = async (): Promise<Resource> => {
+export const detectResources = async (
+  config: ResourceDetectionConfig = {}
+): Promise<Resource> => {
+  const internalConfig: ResourceDetectionConfigWithLogger = Object.assign(
+    {
+      logger: new NoopLogger(),
+    },
+    config
+  );
+
   const resources: Array<Resource> = await Promise.all(
-    DETECTORS.map(d => {
+    (internalConfig.detectors || []).map(async d => {
       try {
-        return d.detect();
-      } catch {
+        const resource = await d.detect(internalConfig);
+        config.logger?.debug(`${d.constructor.name} found resource.`, resource);
+        return resource;
+      } catch (e) {
+        config.logger?.debug(`${d.constructor.name} failed: ${e.message}`);
         return Resource.empty();
       }
     })
   );
+  // Log Resources only if there is a user-provided logger
+  if (config.logger) {
+    logResources(config.logger, resources);
+  }
   return resources.reduce(
     (acc, resource) => acc.merge(resource),
     Resource.createTelemetrySDKResource()
   );
+};
+
+/**
+ * Writes debug information about the detected resources to the logger defined in the resource detection config, if one is provided.
+ *
+ * @param logger The {@link Logger} to write the debug information to.
+ * @param resources The array of {@link Resource} that should be logged. Empty entried will be ignored.
+ */
+const logResources = (logger: Logger, resources: Array<Resource>) => {
+  resources.forEach(resource => {
+    // Print only populated resources
+    if (Object.keys(resource.attributes).length > 0) {
+      const resourceDebugString = util.inspect(resource.attributes, {
+        depth: 2,
+        breakLength: Infinity,
+        sorted: true,
+        compact: false,
+      });
+      logger.debug(resourceDebugString);
+    }
+  });
 };

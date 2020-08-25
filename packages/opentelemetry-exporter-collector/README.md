@@ -6,7 +6,7 @@
 [![devDependencies][devDependencies-image]][devDependencies-url]
 [![Apache License][license-image]][license-image]
 
-This module provides exporter for web and node to be used with [opentelemetry-collector][opentelemetry-collector-url].
+This module provides exporter for web and node to be used with [opentelemetry-collector][opentelemetry-collector-url] - last tested with version **0.6.0**.
 
 ## Installation
 
@@ -14,31 +14,54 @@ This module provides exporter for web and node to be used with [opentelemetry-co
 npm install --save @opentelemetry/exporter-collector
 ```
 
-## Usage in Web
+## Traces in Web
 
-The CollectorExporter in Web expects the endpoint to end in `/v1/trace`.
+The CollectorTraceExporter in Web expects the endpoint to end in `/v1/trace`.
 
 ```js
 import { SimpleSpanProcessor } from '@opentelemetry/tracing';
 import { WebTracerProvider } from '@opentelemetry/web';
-import { CollectorExporter } from '@opentelemetry/exporter-collector';
+import { CollectorTraceExporter } from '@opentelemetry/exporter-collector';
 
 const collectorOptions = {
-  url: '<opentelemetry-collector-url>', // url is optional and can be omitted - default is http://localhost:55678/v1/trace
+  url: '<opentelemetry-collector-url>', // url is optional and can be omitted - default is http://localhost:55681/v1/trace
   headers: {}, //an optional object containing custom headers to be sent with each request
 };
 
 const provider = new WebTracerProvider();
-const exporter = new CollectorExporter(collectorOptions);
+const exporter = new CollectorTraceExporter(collectorOptions);
 provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
 
 provider.register();
 
 ```
 
-## Usage in Node
+## Metrics in Web
 
-The CollectorExporter in Node expects the URL to only be the hostname. It will not work with `/v1/trace`.
+The CollectorMetricExporter in Web expects the endpoint to end in `/v1/metrics`.
+
+```js
+import { MetricProvider } from '@opentelemetry/metrics';
+import { CollectorMetricExporter } from '@opentelemetry/exporter-collector';
+const collectorOptions = {
+  url: '<opentelemetry-collector-url>', // url is optional and can be omitted - default is http://localhost:55681/v1/metrics
+  headers: {}, //an optional object containing custom headers to be sent with each request
+};
+const exporter = new CollectorMetricExporter(collectorOptions);
+
+// Register the exporter
+const meter = new MeterProvider({
+  exporter,
+  interval: 60000,
+}).getMeter('example-meter');
+
+// Now, start recording data
+const counter = meter.createCounter('metric_name');
+counter.add(10, { 'key': 'value' });
+
+```
+
+## Traces in Node - JSON over http
 
 ```js
 const { BasicTracerProvider, SimpleSpanProcessor } = require('@opentelemetry/tracing');
@@ -46,7 +69,10 @@ const { CollectorExporter } =  require('@opentelemetry/exporter-collector');
 
 const collectorOptions = {
   serviceName: 'basic-service',
-  url: '<opentelemetry-collector-url>' // url is optional and can be omitted - default is localhost:55678
+  url: '<opentelemetry-collector-url>', // url is optional and can be omitted - default is http://localhost:55681/v1/trace
+  headers: {
+    foo: 'bar'
+  }, //an optional object containing custom headers to be sent with each request will only work with http
 };
 
 const provider = new BasicTracerProvider();
@@ -57,62 +83,41 @@ provider.register();
 
 ```
 
-By default, plaintext connection is used. In order to use TLS in Node.js, provide `credentials` option like so:
+## Metrics in Node
 
 ```js
-const fs = require('fs');
-const grpc = require('grpc');
-const { BasicTracerProvider, SimpleSpanProcessor } = require('@opentelemetry/tracing');
-const { CollectorExporter } =  require('@opentelemetry/exporter-collector');
-
+const { MeterProvider } = require('@opentelemetry/metrics');
+const { CollectorMetricExporter } =  require('@opentelemetry/exporter-collector');
 const collectorOptions = {
   serviceName: 'basic-service',
-  url: '<opentelemetry-collector-url>', // url is optional and can be omitted - default is localhost:55678
-  credentials: grpc.credentials.createSsl(
-    fs.readFileSync('./ca.crt'),
-    fs.readFileSync('./client.key'),
-    fs.readFileSync('./client.crt')
-  )
+  url: '<opentelemetry-collector-url>', // url is optional and can be omitted - default is http://localhost:55681/v1/metrics
 };
+const exporter = new CollectorMetricExporter(collectorOptions);
 
-const provider = new BasicTracerProvider();
-const exporter = new CollectorExporter(collectorOptions);
-provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
+// Register the exporter
+const meter = new MeterProvider({
+  exporter,
+  interval: 60000,
+}).getMeter('example-meter');
 
-provider.register();
+// Now, start recording data
+const counter = meter.createCounter('metric_name');
+counter.add(10, { 'key': 'value' });
+
 ```
 
-To see how to generate credentials, you can refer to the script used to generate certificates for tests [here](./test/certs/regenerate.sh)
+## GRPC
 
-The exporter can be configured to send custom metadata with each request as in the example below:
+For GRPC please check [npm-url-grpc]
 
-```js
-const grpc = require('grpc');
-const { BasicTracerProvider, SimpleSpanProcessor } = require('@opentelemetry/tracing');
-const { CollectorExporter } =  require('@opentelemetry/exporter-collector');
+## PROTOBUF
 
-const metadata = new grpc.Metadata();
-metadata.set('k', 'v');
-
-const collectorOptions = {
-  serviceName: 'basic-service',
-  url: '<opentelemetry-collector-url>', // url is optional and can be omitted - default is localhost:55678
-  metadata, // // an optional grpc.Metadata object to be sent with each request
-};
-
-const provider = new BasicTracerProvider();
-const exporter = new CollectorExporter(collectorOptions);
-provider.addSpanProcessor(new SimpleSpanProcessor(exporter));
-
-provider.register();
-```
-
-Note, that this will only work if TLS is also configured on the server.
+For PROTOBUF please check [npm-url-proto]
 
 ## Running opentelemetry-collector locally to see the traces
 
-1. Go to examples/basic-tracer-node
-2. run `npm run collector:docker:ot`
+1. Go to examples/collector-exporter-node
+2. run `npm run docker:start`
 3. Open page at `http://localhost:9411/zipkin/` to observe the traces
 
 ## Useful links
@@ -134,5 +139,7 @@ Apache 2.0 - See [LICENSE][license-url] for more information.
 [devDependencies-image]: https://david-dm.org/open-telemetry/opentelemetry-js/dev-status.svg?path=packages/opentelemetry-exporter-collector
 [devDependencies-url]: https://david-dm.org/open-telemetry/opentelemetry-js?path=packages%2Fopentelemetry-exporter-collector&type=dev
 [npm-url]: https://www.npmjs.com/package/@opentelemetry/exporter-collector
+[npm-url-grpc]: https://www.npmjs.com/package/@opentelemetry/exporter-collector-grpc
+[npm-url-proto]: https://www.npmjs.com/package/@opentelemetry/exporter-collector-proto
 [npm-img]: https://badge.fury.io/js/%40opentelemetry%2Fexporter-collector.svg
 [opentelemetry-collector-url]: https://github.com/open-telemetry/opentelemetry-collector

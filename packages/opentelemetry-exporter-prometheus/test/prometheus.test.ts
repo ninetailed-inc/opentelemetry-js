@@ -16,12 +16,16 @@
 
 import { HrTime, ObserverResult } from '@opentelemetry/api';
 import {
+  notifyOnGlobalShutdown,
+  _invokeGlobalShutdown,
+} from '@opentelemetry/core';
+import {
   CounterMetric,
-  CounterSumAggregator,
+  SumAggregator,
   Meter,
   MeterProvider,
-  ObserverMetric,
   Point,
+  Sum,
 } from '@opentelemetry/metrics';
 import * as assert from 'assert';
 import * as http from 'http';
@@ -31,17 +35,18 @@ const mockedHrTime: HrTime = [1586347902211, 0];
 const mockedTimeMS = 1586347902211000;
 
 describe('PrometheusExporter', () => {
-  let toPoint: () => Point;
+  let toPoint: () => Point<Sum>;
+  let removeEvent: Function | undefined;
   before(() => {
-    toPoint = CounterSumAggregator.prototype.toPoint;
-    CounterSumAggregator.prototype.toPoint = function (): Point {
+    toPoint = SumAggregator.prototype.toPoint;
+    SumAggregator.prototype.toPoint = function (): Point<Sum> {
       const point = toPoint.apply(this);
       point.timestamp = mockedHrTime;
       return point;
     };
   });
   after(() => {
-    CounterSumAggregator.prototype.toPoint = toPoint;
+    SumAggregator.prototype.toPoint = toPoint;
   });
   describe('constructor', () => {
     it('should construct an exporter', () => {
@@ -185,16 +190,27 @@ describe('PrometheusExporter', () => {
 
   describe('export', () => {
     let exporter: PrometheusExporter;
+    let meterProvider: MeterProvider;
     let meter: Meter;
 
     beforeEach(done => {
       exporter = new PrometheusExporter();
-      meter = new MeterProvider().getMeter('test-prometheus');
+      meterProvider = new MeterProvider({
+        interval: Math.pow(2, 31) - 1,
+        gracefulShutdown: true,
+      });
+      meter = meterProvider.getMeter('test-prometheus', '1', {
+        exporter: exporter,
+      });
       exporter.startServer(done);
     });
 
     afterEach(done => {
       exporter.shutdown(done);
+      if (removeEvent) {
+        removeEvent();
+        removeEvent = undefined;
+      }
     });
 
     it('should export a count aggregation', done => {
@@ -204,35 +220,36 @@ describe('PrometheusExporter', () => {
 
       const boundCounter = counter.bind({ key1: 'labelValue1' });
       boundCounter.add(10);
-      meter.collect();
-      exporter.export(meter.getBatcher().checkPointSet(), () => {
-        // This is to test the special case where counters are destroyed
-        // and recreated in the exporter in order to get around prom-client's
-        // aggregation and use ours.
-        boundCounter.add(10);
+      meter.collect().then(() => {
         exporter.export(meter.getBatcher().checkPointSet(), () => {
-          http
-            .get('http://localhost:9464/metrics', res => {
-              res.on('data', chunk => {
-                const body = chunk.toString();
-                const lines = body.split('\n');
+          // This is to test the special case where counters are destroyed
+          // and recreated in the exporter in order to get around prom-client's
+          // aggregation and use ours.
+          boundCounter.add(10);
+          exporter.export(meter.getBatcher().checkPointSet(), () => {
+            http
+              .get('http://localhost:9464/metrics', res => {
+                res.on('data', chunk => {
+                  const body = chunk.toString();
+                  const lines = body.split('\n');
 
-                assert.strictEqual(
-                  lines[0],
-                  '# HELP counter a test description'
-                );
+                  assert.strictEqual(
+                    lines[0],
+                    '# HELP counter a test description'
+                  );
 
-                assert.deepStrictEqual(lines, [
-                  '# HELP counter a test description',
-                  '# TYPE counter counter',
-                  `counter{key1="labelValue1"} 20 ${mockedTimeMS}`,
-                  '',
-                ]);
+                  assert.deepStrictEqual(lines, [
+                    '# HELP counter a test description',
+                    '# TYPE counter counter',
+                    `counter{key1="labelValue1"} 20 ${mockedTimeMS}`,
+                    '',
+                  ]);
 
-                done();
-              });
-            })
-            .on('error', errorHandler(done));
+                  done();
+                });
+              })
+              .on('error', errorHandler(done));
+          });
         });
       });
     });
@@ -242,44 +259,48 @@ describe('PrometheusExporter', () => {
         return Math.random();
       }
 
-      const observer = meter.createObserver('metric_observer', {
-        description: 'a test description',
-      }) as ObserverMetric;
+      meter.createValueObserver(
+        'metric_observer',
+        {
+          description: 'a test description',
+        },
+        (observerResult: ObserverResult) => {
+          observerResult.observe(getCpuUsage(), {
+            pid: String(123),
+            core: '1',
+          });
+        }
+      );
 
-      observer.setCallback((observerResult: ObserverResult) => {
-        observerResult.observe(getCpuUsage, { pid: String(123), core: '1' });
-      });
-
-      meter.collect();
-      exporter.export(meter.getBatcher().checkPointSet(), () => {
+      meter.collect().then(() => {
         exporter.export(meter.getBatcher().checkPointSet(), () => {
-          http
-            .get('http://localhost:9464/metrics', res => {
-              res.on('data', chunk => {
-                const body = chunk.toString();
-                const lines = body.split('\n');
+          exporter.export(meter.getBatcher().checkPointSet(), () => {
+            http
+              .get('http://localhost:9464/metrics', res => {
+                res.on('data', chunk => {
+                  const body = chunk.toString();
+                  const lines = body.split('\n');
 
-                assert.strictEqual(
-                  lines[0],
-                  '# HELP metric_observer a test description'
-                );
+                  assert.strictEqual(
+                    lines[0],
+                    '# HELP metric_observer a test description'
+                  );
+                  assert.strictEqual(lines[1], '# TYPE metric_observer gauge');
 
-                assert.strictEqual(lines[1], '# TYPE metric_observer gauge');
+                  const line3 = lines[2].split(' ');
+                  assert.strictEqual(
+                    line3[0],
+                    'metric_observer{pid="123",core="1"}'
+                  );
+                  assert.ok(
+                    parseFloat(line3[1]) >= 0 && parseFloat(line3[1]) <= 1
+                  );
 
-                const line3 = lines[2].split(' ');
-                assert.strictEqual(
-                  line3[0],
-                  'metric_observer{pid="123",core="1"}'
-                );
-                assert.ok(
-                  parseFloat(line3[1]) >= 0 && parseFloat(line3[1]) <= 1
-                );
-                assert.ok(parseInt(line3[2], 10) <= new Date().getTime());
-
-                done();
-              });
-            })
-            .on('error', errorHandler(done));
+                  done();
+                });
+              })
+              .on('error', errorHandler(done));
+          });
         });
       });
     });
@@ -291,8 +312,40 @@ describe('PrometheusExporter', () => {
 
       counter.bind({ counterKey1: 'labelValue1' }).add(10);
       counter.bind({ counterKey1: 'labelValue2' }).add(20);
-      meter.collect();
-      exporter.export(meter.getBatcher().checkPointSet(), () => {
+      meter.collect().then(() => {
+        exporter.export(meter.getBatcher().checkPointSet(), () => {
+          http
+            .get('http://localhost:9464/metrics', res => {
+              res.on('data', chunk => {
+                const body = chunk.toString();
+                const lines = body.split('\n');
+
+                assert.deepStrictEqual(lines, [
+                  '# HELP counter a test description',
+                  '# TYPE counter counter',
+                  `counter{counterKey1="labelValue1"} 10 ${mockedTimeMS}`,
+                  `counter{counterKey1="labelValue2"} 20 ${mockedTimeMS}`,
+                  '',
+                ]);
+
+                done();
+              });
+            })
+            .on('error', errorHandler(done));
+        });
+      });
+    });
+
+    it('should export multiple labels on graceful shutdown', done => {
+      const counter = meter.createCounter('counter', {
+        description: 'a test description',
+      }) as CounterMetric;
+
+      counter.bind({ counterKey1: 'labelValue1' }).add(10);
+      counter.bind({ counterKey1: 'labelValue2' }).add(20);
+      counter.bind({ counterKey1: 'labelValue3' }).add(30);
+
+      removeEvent = notifyOnGlobalShutdown(() => {
         http
           .get('http://localhost:9464/metrics', res => {
             res.on('data', chunk => {
@@ -304,6 +357,39 @@ describe('PrometheusExporter', () => {
                 '# TYPE counter counter',
                 `counter{counterKey1="labelValue1"} 10 ${mockedTimeMS}`,
                 `counter{counterKey1="labelValue2"} 20 ${mockedTimeMS}`,
+                `counter{counterKey1="labelValue3"} 30 ${mockedTimeMS}`,
+                '',
+              ]);
+
+              done();
+            });
+          })
+          .on('error', errorHandler(done));
+      });
+      _invokeGlobalShutdown();
+    });
+
+    it('should export multiple labels on manual shutdown', done => {
+      const counter = meter.createCounter('counter', {
+        description: 'a test description',
+      }) as CounterMetric;
+
+      counter.bind({ counterKey1: 'labelValue1' }).add(10);
+      counter.bind({ counterKey1: 'labelValue2' }).add(20);
+      counter.bind({ counterKey1: 'labelValue3' }).add(30);
+      meterProvider.shutdown(() => {
+        http
+          .get('http://localhost:9464/metrics', res => {
+            res.on('data', chunk => {
+              const body = chunk.toString();
+              const lines = body.split('\n');
+
+              assert.deepStrictEqual(lines, [
+                '# HELP counter a test description',
+                '# TYPE counter counter',
+                `counter{counterKey1="labelValue1"} 10 ${mockedTimeMS}`,
+                `counter{counterKey1="labelValue2"} 20 ${mockedTimeMS}`,
+                `counter{counterKey1="labelValue3"} 30 ${mockedTimeMS}`,
                 '',
               ]);
 
@@ -336,25 +422,26 @@ describe('PrometheusExporter', () => {
 
       const boundCounter = counter.bind({ key1: 'labelValue1' });
       boundCounter.add(10);
-      meter.collect();
-      exporter.export(meter.getBatcher().checkPointSet(), () => {
-        http
-          .get('http://localhost:9464/metrics', res => {
-            res.on('data', chunk => {
-              const body = chunk.toString();
-              const lines = body.split('\n');
+      meter.collect().then(() => {
+        exporter.export(meter.getBatcher().checkPointSet(), () => {
+          http
+            .get('http://localhost:9464/metrics', res => {
+              res.on('data', chunk => {
+                const body = chunk.toString();
+                const lines = body.split('\n');
 
-              assert.deepStrictEqual(lines, [
-                '# HELP counter description missing',
-                '# TYPE counter counter',
-                `counter{key1="labelValue1"} 10 ${mockedTimeMS}`,
-                '',
-              ]);
+                assert.deepStrictEqual(lines, [
+                  '# HELP counter description missing',
+                  '# TYPE counter counter',
+                  `counter{key1="labelValue1"} 10 ${mockedTimeMS}`,
+                  '',
+                ]);
 
-              done();
-            });
-          })
-          .on('error', errorHandler(done));
+                done();
+              });
+            })
+            .on('error', errorHandler(done));
+        });
       });
     });
 
@@ -362,25 +449,26 @@ describe('PrometheusExporter', () => {
       const counter = meter.createCounter('counter.bad-name');
       const boundCounter = counter.bind({ key1: 'labelValue1' });
       boundCounter.add(10);
-      meter.collect();
-      exporter.export(meter.getBatcher().checkPointSet(), () => {
-        http
-          .get('http://localhost:9464/metrics', res => {
-            res.on('data', chunk => {
-              const body = chunk.toString();
-              const lines = body.split('\n');
+      meter.collect().then(() => {
+        exporter.export(meter.getBatcher().checkPointSet(), () => {
+          http
+            .get('http://localhost:9464/metrics', res => {
+              res.on('data', chunk => {
+                const body = chunk.toString();
+                const lines = body.split('\n');
 
-              assert.deepStrictEqual(lines, [
-                '# HELP counter_bad_name description missing',
-                '# TYPE counter_bad_name counter',
-                `counter_bad_name{key1="labelValue1"} 10 ${mockedTimeMS}`,
-                '',
-              ]);
+                assert.deepStrictEqual(lines, [
+                  '# HELP counter_bad_name description missing',
+                  '# TYPE counter_bad_name counter',
+                  `counter_bad_name{key1="labelValue1"} 10 ${mockedTimeMS}`,
+                  '',
+                ]);
 
-              done();
-            });
-          })
-          .on('error', errorHandler(done));
+                done();
+              });
+            })
+            .on('error', errorHandler(done));
+        });
       });
     });
 
@@ -390,22 +478,139 @@ describe('PrometheusExporter', () => {
       });
 
       counter.bind({ key1: 'labelValue1' }).add(20);
-      meter.collect();
-      exporter.export(meter.getBatcher().checkPointSet(), () => {
-        http
-          .get('http://localhost:9464/metrics', res => {
-            res.on('data', chunk => {
-              assert.deepStrictEqual(chunk.toString().split('\n'), [
-                '# HELP counter a test description',
-                '# TYPE counter gauge',
-                'counter{key1="labelValue1"} 20',
-                '',
-              ]);
+      meter.collect().then(() => {
+        exporter.export(meter.getBatcher().checkPointSet(), () => {
+          http
+            .get('http://localhost:9464/metrics', res => {
+              res.on('data', chunk => {
+                assert.deepStrictEqual(chunk.toString().split('\n'), [
+                  '# HELP counter a test description',
+                  '# TYPE counter gauge',
+                  'counter{key1="labelValue1"} 20',
+                  '',
+                ]);
+
+                done();
+              });
+            })
+            .on('error', errorHandler(done));
+        });
+      });
+    });
+
+    it('should export a SumObserver as a counter', done => {
+      function getValue() {
+        return 20;
+      }
+
+      meter.createSumObserver(
+        'sum_observer',
+        {
+          description: 'a test description',
+        },
+        (observerResult: ObserverResult) => {
+          observerResult.observe(getValue(), {
+            key1: 'labelValue1',
+          });
+        }
+      );
+
+      meter.collect().then(() => {
+        exporter.export(meter.getBatcher().checkPointSet(), () => {
+          http
+            .get('http://localhost:9464/metrics', res => {
+              res.on('data', chunk => {
+                const body = chunk.toString();
+                const lines = body.split('\n');
+
+                assert.deepStrictEqual(lines, [
+                  '# HELP sum_observer a test description',
+                  '# TYPE sum_observer counter',
+                  `sum_observer{key1="labelValue1"} 20 ${mockedTimeMS}`,
+                  '',
+                ]);
+              });
 
               done();
-            });
-          })
-          .on('error', errorHandler(done));
+            })
+            .on('error', errorHandler(done));
+        });
+      });
+    });
+
+    it('should export a UpDownSumObserver as a gauge', done => {
+      function getValue() {
+        return 20;
+      }
+
+      meter.createUpDownSumObserver(
+        'updown_observer',
+        {
+          description: 'a test description',
+        },
+        (observerResult: ObserverResult) => {
+          observerResult.observe(getValue(), {
+            key1: 'labelValue1',
+          });
+        }
+      );
+
+      meter.collect().then(() => {
+        exporter.export(meter.getBatcher().checkPointSet(), () => {
+          http
+            .get('http://localhost:9464/metrics', res => {
+              res.on('data', chunk => {
+                const body = chunk.toString();
+                const lines = body.split('\n');
+
+                assert.deepStrictEqual(lines, [
+                  '# HELP updown_observer a test description',
+                  '# TYPE updown_observer gauge',
+                  'updown_observer{key1="labelValue1"} 20',
+                  '',
+                ]);
+              });
+
+              done();
+            })
+            .on('error', errorHandler(done));
+        });
+      });
+    });
+
+    it('should export a ValueRecorder as a gauge', done => {
+      const valueRecorder = meter.createValueRecorder('value_recorder', {
+        description: 'a test description',
+      });
+
+      valueRecorder.bind({ key1: 'labelValue1' }).record(20);
+
+      meter.collect().then(() => {
+        exporter.export(meter.getBatcher().checkPointSet(), () => {
+          http
+            .get('http://localhost:9464/metrics', res => {
+              res.on('data', chunk => {
+                const body = chunk.toString();
+                const lines = body.split('\n');
+
+                assert.strictEqual(
+                  lines[0],
+                  '# HELP value_recorder a test description'
+                );
+                assert.strictEqual(lines[1], '# TYPE value_recorder gauge');
+
+                const line3 = lines[2].split(' ');
+                assert.strictEqual(
+                  line3[0],
+                  'value_recorder{key1="labelValue1"}'
+                );
+                assert.equal(line3[1], 20);
+
+                done();
+              });
+            })
+            .on('error', errorHandler(done));
+        });
       });
     });
   });
@@ -435,8 +640,8 @@ describe('PrometheusExporter', () => {
         prefix: 'test_prefix',
       });
 
-      exporter.startServer(() => {
-        meter.collect();
+      exporter.startServer(async () => {
+        await meter.collect();
         exporter!.export(meter.getBatcher().checkPointSet(), () => {
           http
             .get('http://localhost:9464/metrics', res => {
@@ -464,8 +669,8 @@ describe('PrometheusExporter', () => {
         port: 8080,
       });
 
-      exporter.startServer(() => {
-        meter.collect();
+      exporter.startServer(async () => {
+        await meter.collect();
         exporter!.export(meter.getBatcher().checkPointSet(), () => {
           http
             .get('http://localhost:8080/metrics', res => {
@@ -493,8 +698,8 @@ describe('PrometheusExporter', () => {
         endpoint: '/test',
       });
 
-      exporter.startServer(() => {
-        meter.collect();
+      exporter.startServer(async () => {
+        await meter.collect();
         exporter!.export(meter.getBatcher().checkPointSet(), () => {
           http
             .get('http://localhost:9464/test', res => {
